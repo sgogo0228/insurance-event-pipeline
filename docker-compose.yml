@@ -141,6 +141,18 @@ services:
       TERMINATE_RATE: "0.1"
     restart: unless-stopped
 
+  billing-claims:
+    build: ./services/billing_claims
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *app-db-env
+      RECORDS_PER_SECOND: "2"
+      CLAIM_RATE: "0.1"
+    restart: unless-stopped
+
+  # Polling publisher: reads new payments/claims rows and publishes them to Kafka.
   producer:
     build: ./services/producer
     depends_on:
@@ -151,9 +163,8 @@ services:
     environment:
       <<: [*kafka-env, *app-db-env]
       TOPIC: insurance_events
-      EVENTS_PER_SECOND: "2"
-      CLAIM_RATE: "0.1"
-      DUPLICATE_RATE: "0.05"
+      POLL_INTERVAL_SECONDS: "1"
+      BATCH_SIZE: "500"
     restart: unless-stopped
 
   warehouse-loader:

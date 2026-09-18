@@ -24,6 +24,36 @@ create table policies (
 -- Emit full "before" row images on UPDATE/DELETE so CDC events show what changed.
 alter table policies replica identity full;
 
+-- OLTP tables of the billing & claims system (append-only, published by the polling producer).
+-- event_id is fixed per row, so a re-published row keeps the same event_id and can be deduplicated.
+create table payments (
+    id             bigserial   primary key,
+    event_id       uuid        not null default gen_random_uuid(),
+    payment_id     text        not null unique,
+    policy_id      text        not null,
+    amount         bigint      not null,
+    payment_method text        not null,
+    paid_at        timestamptz not null default now()
+);
+
+create table claims (
+    id           bigserial   primary key,
+    event_id     uuid        not null default gen_random_uuid(),
+    claim_id     text        not null unique,
+    policy_id    text        not null,
+    claim_amount bigint      not null,
+    claim_detail jsonb       not null,
+    filed_at     timestamptz not null default now()
+);
+
+-- Polling producer state: the last row id already published per source table.
+create table publisher_checkpoints (
+    source_table text        primary key,
+    last_id      bigint      not null,
+    updated_at   timestamptz not null default now()
+);
+insert into publisher_checkpoints (source_table, last_id) values ('payments', 0), ('claims', 0);
+
 -- OLTP table of the notification service: the unique key guarantees one notification per claim.
 create table notifications (
     claim_id     text        primary key,

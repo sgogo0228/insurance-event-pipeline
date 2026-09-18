@@ -5,7 +5,8 @@ A containerized pub/sub system built with Kafka and Python, with dbt models that
 It simulates a small insurer:
 
 - A **policy admin system** issues policies and sometimes changes their status.
-- A **billing/claims system** publishes premium payment and claim events.
+- A **billing & claims system** records premium payments and claims.
+- Both business systems only write to their own database. Two change-data-capture mechanisms move the committed changes into Kafka: **Debezium** (log-based) for policies, and a **Python polling producer** for payments and claims.
 - The events are delivered to two independent consumers: a **notification service** (OLTP) and a **warehouse loader** (OLAP).
 - **dbt**, orchestrated by **Airflow**, builds analytics tables from the warehouse data.
 
@@ -15,6 +16,7 @@ It simulates a small insurer:
 flowchart LR
     subgraph OLTP["Postgres (OLTP)"]
         policies[(policies)]
+        billing[(payments / claims)]
         notifications[(notifications)]
     end
 
@@ -22,7 +24,8 @@ flowchart LR
     policies -->|WAL| debezium[Debezium CDC]
     debezium --> t2{{cdc.public.policies}}
 
-    producer[producer] -->|reads active policies| policies
+    bc[billing-claims] -->|INSERT| billing
+    billing -->|poll new rows| producer[producer]
     producer --> t1{{insurance_events}}
 
     t1 -->|group: notification-service| notif[notification-service]
@@ -39,12 +42,12 @@ flowchart LR
     airflow[Airflow] -->|dbt build every 10 min| stg
 ```
 
-Data enters Kafka in two ways:
+Neither business system talks to Kafka. The data is moved into Kafka in two ways, depending on how the data changes:
 
-| Path | Data | How it reaches Kafka | Why |
+| Data | How it changes | How it reaches Kafka | Why this method |
 |---|---|---|---|
-| Application events | Premium payments, claims (immutable facts) | The Python producer publishes them directly | The producing system owns these events |
-| Change Data Capture | Policies (mutable state: active → lapsed / surrendered) | Debezium reads the Postgres write-ahead log | The source application does not need code changes, and every change carries its before/after images |
+| Payments, claims | Append-only (rows are never updated) | **Polling producer** (Python): reads rows with `id` greater than its checkpoint and publishes them | For append-only tables, a query is enough, and it is simple to build and operate |
+| Policies | Mutable (active → lapsed / surrendered) | **Log-based CDC** (Debezium): reads the Postgres write-ahead log | A query only sees the current row. The log also carries the previous values (`before`) and deletes |
 
 ## Quick start
 
@@ -89,11 +92,12 @@ To stop everything and delete all data: `docker compose down -v`.
 | Service | Role |
 |---|---|
 | `kafka`, `kafka-init` | Single KRaft broker (no ZooKeeper). `kafka-init` creates the topics explicitly; auto-creation is disabled. |
-| `postgres` | OLTP database: `policies` (CDC source) and `notifications`. Also stores Airflow metadata in a separate database. |
+| `postgres` | OLTP database: `policies`, `payments`, `claims`, `notifications`, and the producer's `publisher_checkpoints`. Also stores Airflow metadata in a separate database. |
 | `clickhouse` | OLAP warehouse. |
 | `connect`, `connect-init` | Debezium on Kafka Connect. `connect-init` registers the connector through the REST API (`PUT` is idempotent). |
 | `policy-admin` | Issues a policy every few seconds; about 10% of ticks lapse or surrender an existing policy instead. |
-| `producer` | Publishes `premium_paid` and `claim_filed` events for active policies. About 5% of events are deliberately sent twice. |
+| `billing-claims` | Records a payment or a claim (about 10%) for a random active policy, twice per second. |
+| `producer` | Polling publisher. Every second, it reads new `payments` / `claims` rows, publishes them as `premium_paid` / `claim_filed` events, and then saves its checkpoint. |
 | `warehouse-loader` | Consumer group `warehouse-loader`. Batches messages from both topics into `raw.kafka_messages`. |
 | `notification-service` | Consumer group `notification-service`. Notifies the customer once per claim. |
 | `airflow` | Runs dbt layer by layer every 10 minutes. |
@@ -112,7 +116,9 @@ All application events share one envelope, and the message key is `policy_id`:
 }
 ```
 
-`claim_filed.payload.claim_detail` is intentionally semi-structured (a nested object with a `documents` array) and is flattened in dbt.
+- `event_id` is stored on the source row (`payments.event_id`, `claims.event_id`), so a row that is published again keeps the same `event_id` and can be deduplicated downstream.
+- `event_ts` is the business time of the row (`paid_at`, `filed_at`), not the time it was published.
+- `claim_filed.payload.claim_detail` is intentionally semi-structured (a nested object with a `documents` array) and is flattened in dbt.
 
 ## Data model (Medallion layers)
 
@@ -154,7 +160,11 @@ Data quality checks:
 All events of one policy go to the same partition, so their relative order is preserved. Ordering across different policies is not guaranteed, and it is not needed.
 
 **2. At-least-once delivery, made idempotent downstream.**
-The loader commits offsets only after the batch has been written to ClickHouse. A crash between the write and the commit causes a re-read, never data loss. Exactly-once semantics (Kafka transactions) would add a lot of complexity for little gain, because duplicates are cheap to remove later.
+Both data movers follow the same rule: finish the work, then record progress.
+- The producer saves its checkpoint only after Kafka has acknowledged every published event.
+- The loader commits Kafka offsets only after the batch has been written to ClickHouse.
+
+A crash between the two steps causes a re-publish or a re-read, never data loss. Exactly-once semantics (Kafka transactions) would add a lot of complexity for little gain, because duplicates are cheap to remove later.
 
 **3. The loader does not parse messages (schema-on-read).**
 `raw.kafka_messages` stores the message value as a string, together with its Kafka coordinates. Adding a topic or changing an event schema requires no loader change, malformed messages are kept for inspection instead of being lost, and all parsing lives in version-controlled dbt models.
@@ -175,8 +185,12 @@ A payment can reach the warehouse before its policy, for example when CDC lags. 
 **8. Airflow task granularity: one task per layer.**
 This keeps the DAG simple and shows which layer failed. The trade-off is that one failing staging model stops all intermediate models, even unrelated ones. Model-level tasks (for example with astronomer-cosmos) would give finer retries and visibility, at the cost of more moving parts. dbt runs in its own virtualenv inside the Airflow image, so its dependencies cannot conflict with Airflow's.
 
-**9. Why CDC for policies instead of publishing from the app?**
-If an application writes to its database and publishes to Kafka as two separate steps (a "dual write"), the two can diverge when one step fails. CDC reads the committed transaction log, so Kafka only ever sees changes that actually happened. `REPLICA IDENTITY FULL` makes updates carry the previous row image (for example `previous_status`).
+**9. Why business systems never publish to Kafka themselves.**
+If an application writes to its database and publishes to Kafka as two separate steps (a "dual write"), the two can diverge when one step fails. A database transaction cannot include the Kafka publish. Here, each system only writes to its own database, and a separate mover publishes what has been **committed**:
+- **Log-based CDC (Debezium)** for `policies`. It sees updates and deletes, and `REPLICA IDENTITY FULL` makes updates carry the previous row image (for example `previous_status`).
+- **Polling producer** for the append-only `payments` / `claims` tables. It is simpler, but a query only sees the current state of rows. That is sufficient for tables that are never updated.
+
+If an application must publish domain events itself, the standard fix is the **transactional outbox** pattern: write the event to an `outbox` table in the same transaction, then relay that table to Kafka with either of the two mechanisms above.
 
 **10. Why ClickHouse for a BigQuery shop?**
 It is a columnar OLAP engine that runs locally in Docker, and it shares the properties that shaped this design: no enforced primary keys, append-friendly storage, and a preference for batched inserts. Swapping it for BigQuery mainly changes the dbt adapter and SQL functions, not the architecture.
@@ -185,16 +199,17 @@ It is a columnar OLAP engine that runs locally in Docker, and it shares the prop
 
 Each scenario is deterministic and can be triggered on demand.
 
-### 1. Duplicate event
+### 1. Producer crash between publish and checkpoint (duplicate events)
 
 ```bash
-docker compose run --rm producer python scenario.py duplicate
+docker compose stop producer          # new payments/claims pile up in Postgres
+docker compose run --rm -e CRASH_AFTER_PUBLISH=true producer   # publishes the backlog, exits before saving checkpoints
+docker compose start producer         # publishes the same rows again, with the same event_id
 ```
 
-The same claim is published twice with the same `event_id`.
-- `raw.kafka_messages` contains 2 rows.
-- The notification service logs `skip claim ...: customer already notified`, and `notifications` contains 1 row.
-- After `dbt build`, `staging.stg_claims` contains 1 row.
+- `raw.kafka_messages` contains two copies of each re-published event.
+- The notification service logs `skip claim ...: customer already notified` for the re-published claims, and `notifications` still has one row per claim.
+- After `dbt build`, staging has one row per `event_id`.
 
 ### 2. Consumer crash between write and commit (re-read)
 
@@ -209,17 +224,17 @@ The restarted loader waits for the crashed member's session to time out (`sessio
 ### 3. Late-arriving policy
 
 ```bash
-docker compose run --rm producer python scenario.py late --delay 120
+docker compose run --rm billing-claims python scenario.py late --delay 120
 ```
 
-A payment is sent for a policy that will only be created 120 seconds later.
+A payment is recorded for a policy that will only be created 120 seconds later.
 - A dbt run during the delay reports `WARN 1 warn_payments_without_policy`, and `fct_premium_daily` has an `UNKNOWN` row.
 - Once the policy arrives through CDC, the next dbt run resolves it, and the warning disappears.
 
 ### 4. Bad data blocks downstream models
 
 ```bash
-docker compose run --rm producer python scenario.py bad-claim
+docker compose run --rm billing-claims python scenario.py bad-claim
 docker compose exec airflow dbt build
 ```
 
@@ -251,6 +266,7 @@ docker compose exec clickhouse clickhouse-client -u analytics --password analyti
 
 ## Limitations and next steps
 
+- **Polling producer and concurrent writers:** polling by `id > checkpoint` assumes that ids become visible in order. That holds for the single-writer simulator, but with concurrent transactions, a lower id can commit after a higher one and be skipped. Production options: log-based CDC for these tables too, or an outbox table relayed by CDC.
 - **Dead letter queue:** malformed messages are stored in raw and filtered in dbt. A DLQ topic would surface them to the source team faster.
 - **Schema management:** events are schemaless JSON. A schema registry (Avro or Protobuf) would enforce compatibility at publish time.
 - **Policy history:** `stg_policy_changes` already holds every change. It could be exposed as an SCD Type 2 dimension (`valid_from` / `valid_to`).
@@ -269,7 +285,8 @@ docker compose exec clickhouse clickhouse-client -u analytics --password analyti
 ├── cdc/policies-connector.json    # Debezium connector config
 ├── services/
 │   ├── policy_admin/              # simulated policy admin system (OLTP writes)
-│   ├── producer/                  # Kafka producer + demo scenarios
+│   ├── billing_claims/            # simulated billing & claims system (OLTP writes) + demo scenarios
+│   ├── producer/                  # polling producer: payments/claims tables -> Kafka
 │   └── consumers/                 # warehouse loader, notification service
 ├── dbt/                           # staging → intermediate → marts, tests
 ├── airflow/                       # image with dbt venv, DAG
