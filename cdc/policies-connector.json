@@ -1,0 +1,19 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "plugin.name": "pgoutput",
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "app",
+  "database.password": "app",
+  "database.dbname": "insurance_app",
+  "topic.prefix": "cdc",
+  "table.include.list": "public.policies",
+  "slot.name": "policies_cdc",
+  "publication.name": "policies_cdc",
+  "publication.autocreate.mode": "filtered",
+  "tombstones.on.delete": "false",
+  "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "key.converter.schemas.enable": "false",
+  "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter.schemas.enable": "false"
+}

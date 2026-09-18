@@ -1,0 +1,218 @@
+name: insurance-event-pipeline
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+x-app-db-env: &app-db-env
+  APP_DB_DSN: postgresql://app:app@postgres:5432/insurance_app
+
+x-clickhouse-env: &clickhouse-env
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_USER: analytics
+  CLICKHOUSE_PASSWORD: analytics
+
+services:
+  # ---------- Messaging ----------
+  kafka:
+    image: apache/kafka:4.0.0
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+  kafka-init:
+    image: apache/kafka:4.0.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic insurance_events --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic cdc.public.policies --partitions 1 --replication-factor 1
+
+  # ---------- OLTP: policy admin system + notifications (also Airflow metadata) ----------
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d insurance_app"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------- OLAP: analytics warehouse ----------
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    ports:
+      - "8123:8123"
+    environment:
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user analytics --password analytics --query 'select 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------- CDC: Postgres policies -> Kafka ----------
+  connect:
+    image: quay.io/debezium/connect:3.2
+    ports:
+      - "8083:8083"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: cdc-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8083/connectors > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  connect-init:
+    image: curlimages/curl:8.15.0
+    depends_on:
+      connect:
+        condition: service_healthy
+    volumes:
+      - ./cdc/policies-connector.json:/policies-connector.json:ro
+    command:
+      - -fsS
+      - -X
+      - PUT
+      - -H
+      - "Content-Type: application/json"
+      - --data
+      - "@/policies-connector.json"
+      - http://connect:8083/connectors/policies-cdc/config
+
+  # ---------- Applications ----------
+  policy-admin:
+    build: ./services/policy_admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *app-db-env
+      INTERVAL_SECONDS: "3"
+      TERMINATE_RATE: "0.1"
+    restart: unless-stopped
+
+  producer:
+    build: ./services/producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: [*kafka-env, *app-db-env]
+      TOPIC: insurance_events
+      EVENTS_PER_SECOND: "2"
+      CLAIM_RATE: "0.1"
+      DUPLICATE_RATE: "0.05"
+    restart: unless-stopped
+
+  warehouse-loader:
+    build: ./services/consumers
+    command: ["python", "warehouse_loader.py"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: [*kafka-env, *clickhouse-env]
+      TOPICS: insurance_events,cdc.public.policies
+      GROUP_ID: warehouse-loader
+      BATCH_SIZE: "200"
+      BATCH_TIMEOUT_SECONDS: "5"
+    restart: unless-stopped
+
+  notification-service:
+    build: ./services/consumers
+    command: ["python", "notification_service.py"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: [*kafka-env, *app-db-env]
+      TOPIC: insurance_events
+      GROUP_ID: notification-service
+    restart: unless-stopped
+
+  # ---------- Orchestration: Airflow runs dbt ----------
+  airflow:
+    build: ./airflow
+    command: standalone
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *clickhouse-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+      AIRFLOW__API_AUTH__JWT_SECRET: local-demo-only-jwt-secret
+      DBT_PROJECT_DIR: /opt/airflow/dbt
+      DBT_PROFILES_DIR: /opt/airflow/dbt
+      DBT_TARGET_PATH: /tmp/dbt/target
+      DBT_LOG_PATH: /tmp/dbt/logs
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./dbt:/opt/airflow/dbt
+
+volumes:
+  postgres-data:
+  clickhouse-data:

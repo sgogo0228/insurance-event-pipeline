@@ -1,0 +1,3 @@
+-r services/producer/requirements.txt
+-r services/consumers/requirements.txt
+pytest==9.1.1

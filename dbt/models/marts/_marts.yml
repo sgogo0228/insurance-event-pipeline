@@ -1,0 +1,16 @@
+models:
+  - name: fct_premium_daily
+    description: Premium collected per day and product. Dashboard-ready.
+    columns:
+      - name: payment_date
+        data_tests: [not_null]
+      - name: product_code
+        data_tests: [not_null]
+
+  - name: mart_claim_ratio_by_product
+    description: >
+      Policies, premium collected and claims per product. Dashboard-ready.
+      claim_ratio = claim amount filed / premium collected (simplified; not an actuarial loss ratio).
+    columns:
+      - name: product_code
+        data_tests: [unique, not_null]

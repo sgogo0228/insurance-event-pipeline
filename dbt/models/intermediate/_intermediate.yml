@@ -1,0 +1,17 @@
+models:
+  - name: int_policies_current
+    description: Current state of each policy, rebuilt from the CDC change history.
+    columns:
+      - name: policy_id
+        data_tests: [unique, not_null]
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["active", "lapsed", "surrendered"]
+
+  - name: int_policy_activity
+    description: One row per policy with its payment and claim totals.
+    columns:
+      - name: policy_id
+        data_tests: [unique, not_null]

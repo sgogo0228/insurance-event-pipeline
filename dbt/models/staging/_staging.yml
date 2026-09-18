@@ -1,0 +1,37 @@
+models:
+  - name: stg_premium_payments
+    description: One row per premium payment event (deduplicated by event_id).
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]
+      - name: policy_id
+        data_tests: [not_null]
+      - name: payment_method
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["credit_card", "bank_transfer", "auto_debit"]
+
+  - name: stg_claims
+    description: One row per claim event, with the semi-structured claim_detail flattened.
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]
+      - name: claim_id
+        data_tests: [unique, not_null]
+      - name: claim_category
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["death", "hospitalization", "surgery", "outpatient", "injury", "disability"]
+
+  - name: stg_policy_changes
+    description: Every captured change of the policies table (CDC history), one row per change.
+    columns:
+      - name: change_id
+        data_tests: [unique, not_null]
+      - name: op
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["c", "u", "d", "r"]

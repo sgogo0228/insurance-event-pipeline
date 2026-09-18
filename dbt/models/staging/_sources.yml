@@ -1,0 +1,11 @@
+sources:
+  - name: raw
+    schema: raw
+    description: Bronze layer - every Kafka message stored as-is by the warehouse loader.
+    tables:
+      - name: kafka_messages
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            warn_after: {count: 15, period: minute}
+            error_after: {count: 60, period: minute}

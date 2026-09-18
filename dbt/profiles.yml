@@ -1,0 +1,11 @@
+insurance_analytics:
+  target: local
+  outputs:
+    local:
+      type: clickhouse
+      host: "{{ env_var('CLICKHOUSE_HOST', 'localhost') }}"
+      port: 8123
+      user: "{{ env_var('CLICKHOUSE_USER', 'analytics') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD', 'analytics') }}"
+      schema: analytics
+      threads: 4
