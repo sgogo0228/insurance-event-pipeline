@@ -42,7 +42,7 @@ def stop(*_):
 def new_policy_values(rng: random.Random) -> tuple:
     product_code = rng.choice(list(PRODUCTS))
     low, high, rate = PRODUCTS[product_code]
-    sum_insured = rng.randrange(low, high + 1, 100_000)
+    sum_insured = rng.randrange(low, high + 1, low)
     return f"C{rng.randint(1, 500):05d}", product_code, sum_insured, round(sum_insured * rate)
 
 
