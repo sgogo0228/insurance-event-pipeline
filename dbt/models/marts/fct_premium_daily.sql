@@ -1,4 +1,4 @@
-{{ config(order_by='(payment_date, product_code)') }}
+{{ config(tags=['shared'], order_by='(payment_date, product_code)') }}
 
 with payments as (
     select

@@ -1,4 +1,4 @@
-{{ config(order_by='policy_id') }}
+{{ config(tags=['policy'], order_by='policy_id') }}
 
 -- Replay the CDC history: the change with the highest log position is the current state of each policy.
 with ranked as (

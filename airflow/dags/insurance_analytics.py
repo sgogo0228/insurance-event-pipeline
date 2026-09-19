@@ -5,7 +5,7 @@ from airflow.sdk import DAG
 
 with DAG(
     dag_id="insurance_analytics",
-    description="Refresh the insurance analytics warehouse layer by layer with dbt build",
+    description="Refresh the insurance analytics warehouse per business domain with dbt build",
     schedule="*/10 * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
@@ -19,9 +19,11 @@ with DAG(
         bash_command="dbt source freshness",
     )
 
-    # `dbt build` runs models and their tests in DAG order; a failing test skips everything downstream.
-    build_staging = BashOperator(task_id="build_staging", bash_command="dbt build --select staging")
-    build_intermediate = BashOperator(task_id="build_intermediate", bash_command="dbt build --select intermediate")
-    build_marts = BashOperator(task_id="build_marts", bash_command="dbt build --select marts")
+    # Each domain is selected by its dbt tag; `dbt build` runs models and their tests in DAG order.
+    build_policy = BashOperator(task_id="build_policy", bash_command="dbt build --select tag:policy")
+    build_billing = BashOperator(task_id="build_billing", bash_command="dbt build --select tag:billing")
 
-    source_freshness >> build_staging >> build_intermediate >> build_marts
+    # Cross-domain models (A & B & C -> D) only run when both domains succeeded.
+    build_shared = BashOperator(task_id="build_shared", bash_command="dbt build --select tag:shared")
+
+    source_freshness >> [build_policy, build_billing] >> build_shared

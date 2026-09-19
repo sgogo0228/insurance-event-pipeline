@@ -1,4 +1,4 @@
-{{ config(unique_key='event_id', order_by='(paid_at, event_id)') }}
+{{ config(tags=['billing'], unique_key='event_id', order_by='(paid_at, event_id)') }}
 
 with source as (
     select message_value, ingested_at

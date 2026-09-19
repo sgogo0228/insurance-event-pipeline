@@ -1,4 +1,4 @@
-{{ config(order_by='product_code') }}
+{{ config(tags=['shared'], order_by='product_code') }}
 
 select
     product_code,

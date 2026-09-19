@@ -1,4 +1,4 @@
-{{ config(order_by='policy_id') }}
+{{ config(tags=['shared'], order_by='policy_id') }}
 
 -- One row per policy combining its current state (A), payments (B) and claims (C).
 with payments as (

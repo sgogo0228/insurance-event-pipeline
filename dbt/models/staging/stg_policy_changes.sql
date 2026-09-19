@@ -1,4 +1,4 @@
-{{ config(unique_key='change_id', order_by='(policy_id, lsn)') }}
+{{ config(tags=['policy'], unique_key='change_id', order_by='(policy_id, lsn)') }}
 
 with source as (
     select message_value, ingested_at

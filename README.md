@@ -100,7 +100,7 @@ To stop everything and delete all data: `docker compose down -v`.
 | `producer` | Polling publisher. Every second, it reads new `payments` / `claims` rows, publishes them as `premium_paid` / `claim_filed` events, and then saves its checkpoint. |
 | `warehouse-loader` | Consumer group `warehouse-loader`. Batches messages from both topics into `raw.kafka_messages`. |
 | `notification-service` | Consumer group `notification-service`. Notifies the customer once per claim. |
-| `airflow` | Runs dbt layer by layer every 10 minutes. |
+| `airflow` | Runs dbt per business domain every 10 minutes. |
 
 ## Event contract
 
@@ -141,6 +141,16 @@ stg_premium_payments ───────────────────�
 stg_claims ────────────────────────────────┘
 ```
 
+Folders define the **layer** (staging / intermediate / marts). Tags define the **business domain**, and the domain is what Airflow schedules:
+
+| Tag | Models |
+|---|---|
+| `policy` | `stg_policy_changes`, `int_policies_current` |
+| `billing` | `stg_premium_payments`, `stg_claims` |
+| `shared` (needs both domains) | `int_policy_activity`, `fct_premium_daily`, `mart_claim_ratio_by_product` |
+
+Mart columns are documented in `_marts.yml`, and `persist_docs` writes the descriptions into ClickHouse as table and column comments.
+
 Data quality checks:
 
 - Generic tests: `unique`, `not_null`, `accepted_values` on keys and enumerations.
@@ -180,19 +190,56 @@ Events are append-only, so staging models only read raw rows newer than their ow
 A payment can reach the warehouse before its policy, for example when CDC lags. Blocking the pipeline would delay every report for one late record. Instead, the payment is kept as `UNKNOWN`, a warning is raised, and the next run resolves it.
 
 **7. Guaranteeing upstream correctness (A & B & C → D).**
-`dbt build` runs models and their tests in dependency order. When a blocking test fails, every model downstream of it is **skipped**, so the mart is never built on bad data. Airflow adds the same guarantee at the task level: `source_freshness → build_staging → build_intermediate → build_marts`. A failed layer marks later layers as `upstream_failed`. `max_active_runs=1` prevents overlapping runs.
+`dbt build` runs models and their tests in dependency order. When a blocking test fails, every model downstream of it is **skipped**, so the mart is never built on bad data. Airflow adds the same guarantee at the task level:
 
-**8. Airflow task granularity: one task per layer.**
-This keeps the DAG simple and shows which layer failed. The trade-off is that one failing staging model stops all intermediate models, even unrelated ones. Model-level tasks (for example with astronomer-cosmos) would give finer retries and visibility, at the cost of more moving parts. dbt runs in its own virtualenv inside the Airflow image, so its dependencies cannot conflict with Airflow's.
+```
+source_freshness ─┬→ build_policy  (dbt build --select tag:policy)  ─┬→ build_shared (dbt build --select tag:shared)
+                  └→ build_billing (dbt build --select tag:billing) ─┘
+```
 
-**9. Why business systems never publish to Kafka themselves.**
+`build_shared` only runs when both domains succeeded. If one domain fails, `build_shared` becomes `upstream_failed`. `max_active_runs=1` prevents overlapping runs.
+
+**8. Airflow task granularity: one task per business domain.**
+The two domains run in parallel and fail independently. For example, a bad claim stops the billing domain and the shared marts, but policies keep being refreshed.
+
+The trade-offs of other granularities:
+- **One task per layer** (staging → intermediate → marts) is simpler, but one bad staging model stops every downstream model, even unrelated ones.
+- **One task per model** (for example with astronomer-cosmos) gives the finest retries and visibility, at the cost of another dependency and a large DAG.
+
+dbt runs in its own virtualenv inside the Airflow image, so its dependencies cannot conflict with Airflow's.
+
+**9. Scaling out: one DAG per domain (discussed, not implemented).**
+Airflow can manage dependencies at two levels: between tasks inside a DAG (used here), or between DAGs. With several teams or different schedules per domain, each domain would get its own DAG, and the shared marts would move to a third DAG triggered by **asset-aware scheduling**:
+
+```python
+# policy DAG:  BashOperator(..., bash_command="dbt build --select tag:policy",  outlets=[Asset("policy_models")])
+# billing DAG: BashOperator(..., bash_command="dbt build --select tag:billing", outlets=[Asset("billing_models")])
+# marts DAG:
+with DAG(dag_id="insurance_marts", schedule=[Asset("policy_models"), Asset("billing_models")]): ...
+```
+
+An asset is only updated when the producing task succeeds, and the marts DAG runs once **both** assets have been updated. Bad upstream data therefore never triggers the marts.
+
+Compared with the alternatives:
+- `ExternalTaskSensor` requires the DAG schedules to line up.
+- `TriggerDagRunOperator` cannot express "wait for both".
+
+The risk is silence: a failing domain means the marts simply stop refreshing. Source freshness checks and alerting are required.
+
+| Keep it in one DAG when… | Split into DAGs when… |
+|---|---|
+| steps share a schedule and an owner | domains have different schedules or owners |
+| a failure should stop the whole run | failures must stay isolated |
+| there is a single downstream consumer | one upstream feeds many consumers (finance, actuarial, marketing) |
+
+**10. Why business systems never publish to Kafka themselves.**
 If an application writes to its database and publishes to Kafka as two separate steps (a "dual write"), the two can diverge when one step fails. A database transaction cannot include the Kafka publish. Here, each system only writes to its own database, and a separate mover publishes what has been **committed**:
 - **Log-based CDC (Debezium)** for `policies`. It sees updates and deletes, and `REPLICA IDENTITY FULL` makes updates carry the previous row image (for example `previous_status`).
 - **Polling producer** for the append-only `payments` / `claims` tables. It is simpler, but a query only sees the current state of rows. That is sufficient for tables that are never updated.
 
 If an application must publish domain events itself, the standard fix is the **transactional outbox** pattern: write the event to an `outbox` table in the same transaction, then relay that table to Kafka with either of the two mechanisms above.
 
-**10. Why ClickHouse for a BigQuery shop?**
+**11. Why ClickHouse for a BigQuery shop?**
 It is a columnar OLAP engine that runs locally in Docker, and it shares the properties that shaped this design: no enforced primary keys, append-friendly storage, and a preference for batched inserts. Swapping it for BigQuery mainly changes the dbt adapter and SQL functions, not the architecture.
 
 ## Demo scenarios
@@ -241,7 +288,7 @@ docker compose exec airflow dbt build
 - `assert_claim_amount_positive` fails.
 - `int_policy_activity` and `mart_claim_ratio_by_product` are **SKIPPED**.
 - `fct_premium_daily` is still built, because it does not depend on claims.
-- In Airflow, `build_staging` fails, and the later layers are `upstream_failed`.
+- In Airflow, `build_billing` fails, `build_shared` is `upstream_failed`, and `build_policy` still succeeds.
 
 To recover, remove or correct the bad record, then rebuild:
 
