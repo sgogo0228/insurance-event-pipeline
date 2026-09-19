@@ -24,3 +24,7 @@ models:
       +schema: marts
       +materialized: table
       +tags: ["gold"]
+      # Write model/column descriptions into the warehouse as table and column comments.
+      +persist_docs:
+        relation: true
+        columns: true

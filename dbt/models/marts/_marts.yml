@@ -1,16 +1,39 @@
 models:
   - name: fct_premium_daily
-    description: Premium collected per day and product. Dashboard-ready.
+    description: 每日各商品的保費收入（dashboard 用）。Premium collected per day and product.
     columns:
       - name: payment_date
+        description: 繳費日期（UTC）
         data_tests: [not_null]
       - name: product_code
+        description: 商品代碼：TERM_LIFE 定期壽險、MEDICAL 醫療險、ACCIDENT 意外險；保單資料尚未到達時為 UNKNOWN
         data_tests: [not_null]
+      - name: payment_count
+        description: 當日繳費筆數
+      - name: paying_policies
+        description: 當日有繳費的保單數（不重複計算）
+      - name: premium_collected
+        description: 當日實收保費金額
 
   - name: mart_claim_ratio_by_product
     description: >
-      Policies, premium collected and claims per product. Dashboard-ready.
-      claim_ratio = claim amount filed / premium collected (simplified; not an actuarial loss ratio).
+      各商品的保單數、實收保費與理賠統計（dashboard 用）。
+      理賠率為簡化指標（理賠申請金額 ÷ 實收保費），不是精算上的損失率。
     columns:
       - name: product_code
+        description: 商品代碼：TERM_LIFE 定期壽險、MEDICAL 醫療險、ACCIDENT 意外險
         data_tests: [unique, not_null]
+      - name: policy_count
+        description: 保單總數（含已終止的保單）
+      - name: active_policies
+        description: 有效保單數
+      - name: terminated_policies
+        description: 已終止保單數（停效 + 解約）
+      - name: total_premium_collected
+        description: 累計實收保費金額
+      - name: total_claims
+        description: 累計理賠件數
+      - name: total_claim_amount
+        description: 累計理賠申請金額
+      - name: claim_ratio
+        description: 理賠率 = 累計理賠申請金額 ÷ 累計實收保費（實收保費為 0 時記為 0），四捨五入到小數第 4 位
