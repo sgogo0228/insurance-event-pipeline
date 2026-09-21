@@ -31,7 +31,7 @@ flowchart LR
     debezium --> t2{{cdc.public.policies}}
 
     bc[billing-claims] -->|INSERT| billing
-    billing -->|poll new rows| producer[producer]
+    billing -->|poll new rows| producer[producer polling]
     producer --> t1{{insurance_events}}
 
     t1 -->|group: notification-service| notif[notification-service]
@@ -50,6 +50,17 @@ flowchart LR
 
 ## Design decisions and trade-offs
 
+### Two databases: OLTP and OLAP
+
+The project runs two databases because they play different roles, and the data team only owns one of them:
+
+| 資料庫 | 角色 | 在作業中的用途 |
+|---|---|---|
+| **Postgres（OLTP）** | 業務系統的資料庫：一次處理一筆，要求即時寫入與讀取 | 保單、繳費、理賠，以及通知紀錄。代表資料團隊**無法修改**的既有（legacy）系統 |
+| **ClickHouse（OLAP）** | 資料團隊的分析倉儲：一次掃描大量資料做彙總 | Medallion 分層（raw → staging → intermediate → marts）。**本機用 ClickHouse 代替 BigQuery**：兩者都是欄式 OLAP、都不強制主鍵唯一，因此整個架構可以直接套用到 BigQuery，主要差別只在 dbt adapter 和 SQL 函式 |
+
+Everything in between — CDC, Kafka, the loader, dbt and Airflow — exists to move data out of systems the data team cannot change, into the warehouse it owns.
+
 ### 1. Two business systems
 
 The homework defines two business systems. These definitions are assumptions made for this exercise, not a claim about how a real insurer works:
@@ -61,13 +72,13 @@ The homework defines two business systems. These definitions are assumptions mad
 
 Having two systems serves several purposes:
 
-1. **Multiple upstream sources.** The claim ratio mart needs policies, payments, and claims, which is the "A & B & C → D" case: D must only be built when all of its inputs are correct (see [decision 8](#8-guaranteeing-upstream-correctness-a--b--c--d)).
+1. **Multiple upstream sources.** The claim ratio mart needs policies, payments, and claims, which is the "A & B & C → D" case: D must only be built when all of its inputs are correct (see [decision 7](#7-guaranteeing-upstream-correctness-a--b--c--d)).
 2. **Two change patterns, two capture methods.** Mutable data (policies) and append-only data (payments/claims) are best captured in different ways (see [decision 3](#3-getting-database-changes-into-kafka-cdc-polling-or-outbox)).
 3. **Two kinds of consumers.** A claim must trigger a customer notification right away, exactly once per claim (an OLTP concern). All events also feed the warehouse, where correctness is only needed after the next dbt run (an OLAP concern).
 
 ### 2. Business systems never publish to Kafka themselves
 
-**The business systems are separate from the components that publish to Kafka.** `policy-admin` and `billing-claims` only write to Postgres and contain no Kafka code. They stand in for legacy or core systems owned by other teams, whose code the data team usually cannot change. Getting their data into Kafka is the data team's job: Debezium and the polling producer are the data team's components.
+**The business systems are separate from the components that publish to Kafka.** `policy-admin` and `billing-claims` only write to Postgres and contain no Kafka code. They stand in for **legacy or core systems owned by other teams, whose code the data team usually cannot change**. Getting their data into Kafka is the data team's job: Debezium and the polling producer are the data team's components.
 
 This separation also avoids the **dual-write problem**. If an application writes to its database and then publishes to Kafka, the two steps can diverge when one fails, because a database transaction cannot include the Kafka publish. Here, only data that has already been **committed** to the database is published.
 
@@ -116,11 +127,7 @@ Claims carry a **semi-structured** part: a nested object with a free-text descri
 - **New fields are non-breaking.** A new field in the source is kept in raw automatically, and it becomes available once a staging model extracts it.
 - On BigQuery, the same approach uses a `JSON` column with `JSON_VALUE` / `JSON_QUERY`, and `UNNEST` for arrays.
 
-### 5. Ordering: the message key is `policy_id`
-
-All events of one policy go to the same partition, so their relative order is preserved. Debezium uses the table's primary key (`policy_id`) as the key for the same reason. Ordering across different policies is not guaranteed, and it is not needed.
-
-### 6. At-least-once delivery, and two kinds of duplicates
+### 5. At-least-once delivery, and two kinds of duplicates
 
 Both data movers follow the same rule: finish the work, then record progress.
 
@@ -140,11 +147,11 @@ Duplicates therefore have to be handled, and there are two different kinds:
 - **The OLTP side rejects duplicates immediately, while the OLAP side cleans them up later.** A sent email cannot be taken back, so the notification service checks the unique `claim_id` in the same transaction as the send. ClickHouse, like BigQuery, does not enforce primary keys, so the warehouse keeps raw rows as they arrive and deduplicates in dbt.
 - Two separate claims for the same real-world event, with **different** claim numbers, cannot be detected by any id. They need business rules (for example, same policy, same day, same amount) and a manual review.
 
-### 7. Late-arriving data: warn, don't block
+### 6. Late-arriving data: warn, don't block
 
 A payment can reach the warehouse before its policy, for example when CDC lags behind the polling producer. Blocking the pipeline would delay every report because of one late record. Instead, the payment is reported as `UNKNOWN` and a warning is raised. The marts are fully rebuilt on each run, so the next run resolves the record once the policy arrives. In dimensional modeling, this is a *late-arriving dimension*.
 
-### 8. Guaranteeing upstream correctness (A & B & C → D)
+### 7. Guaranteeing upstream correctness (A & B & C → D)
 
 `dbt build` runs models and their tests in dependency order. When a blocking test fails, every model downstream of it is **skipped**, so the mart is never built on bad data. Airflow adds the same guarantee at the task level:
 
@@ -155,7 +162,7 @@ source_freshness ─┬→ build_policy  (dbt build --select tag:policy)  ─┬
 
 `build_shared` only runs when both domains succeeded. If one domain fails, `build_shared` becomes `upstream_failed`. `max_active_runs=1` prevents overlapping runs.
 
-### 9. Airflow granularity: one task per business domain
+### 8. Airflow granularity: one task per business domain
 
 The two domains run in parallel and fail independently. For example, a bad claim stops the billing domain and the shared marts, but policies keep being refreshed.
 
@@ -182,9 +189,30 @@ Other cross-DAG options: `ExternalTaskSensor` requires the DAG schedules to line
 
 dbt runs in its own virtualenv inside the Airflow image, so its dependencies cannot conflict with Airflow's.
 
-### 10. Why ClickHouse for a BigQuery shop?
+### 9. Data freshness: the refresh interval is not the data latency
 
-ClickHouse is a columnar OLAP engine that runs locally in Docker. It shares the properties that shaped this design: no enforced primary keys, append-friendly storage, and a preference for batched inserts. Swapping it for BigQuery mainly changes the dbt adapter and the SQL functions, not the architecture (see [Moving to Google Cloud](#moving-to-google-cloud)).
+The pipeline is a **micro-batch**: ingestion runs continuously, while transformation runs on a schedule. What a user sees is the sum of every step:
+
+| 階段 | 設定 | 最差情況的延遲 |
+|---|---|---|
+| 繳費／理賠寫入 Postgres → producer 查到並 publish | `POLL_INTERVAL_SECONDS=1` | 1 秒 |
+| 保單異動 → Debezium publish | 讀 WAL，持續串流 | 接近即時 |
+| Kafka → loader 寫進 ClickHouse | `BATCH_SIZE=200`、`BATCH_TIMEOUT_SECONDS=5` | 5 秒 |
+| 等下一次 Airflow 排程 | `schedule="*/10 * * * *"` | 10 分鐘 |
+| dbt build 執行 | 7 個 model + 26 個測試 | 約 20 秒 |
+| **合計** | | **約 10 分 25 秒** |
+
+So a "data must be less than 10 minutes old" requirement is **not** met by a 10-minute schedule. The interval has to be shorter than the target, to leave room for ingestion and for the run itself: `*/5` brings the worst case to roughly 5.5 minutes.
+
+Running more often is affordable here because each run is cheap: staging models are incremental, so a run only parses the raw rows that arrived since the last one. On BigQuery, where queries are billed by bytes scanned, that difference is what makes a short interval viable at all.
+
+Going below a few minutes means changing the approach, not the schedule:
+
+| 需要的延遲 | 做法 | 代價 |
+|---|---|---|
+| 數分鐘 | micro-batch：縮短排程間隔 + dbt 增量更新（**目前的做法**） | 每次執行都有固定成本，間隔越短、跑得越頻繁 |
+| 約一分鐘 | 事件驅動：上游寫完就觸發（Airflow 的 Asset 排程，或由外部呼叫 REST API 觸發 DAG） | 觸發會很頻繁，要用 `max_active_runs` 節流；排程變得較難預測 |
+| 秒級 | 串流處理（Flink、Dataflow）直接算出結果 | 不再是 dbt + Airflow 的架構；開發與維運成本高很多，回補歷史資料也比較麻煩 |
 
 ## Event contract
 
@@ -200,7 +228,7 @@ All application events share one envelope, and the message key is `policy_id`:
 }
 ```
 
-- `event_id` comes from the source row and is stable across re-publishing (see [decision 6](#6-at-least-once-delivery-and-two-kinds-of-duplicates)).
+- `event_id` comes from the source row and is stable across re-publishing (see [decision 5](#5-at-least-once-delivery-and-two-kinds-of-duplicates)).
 - `event_ts` is the business time of the row (`paid_at`, `filed_at`), not the time it was published.
 - Policy changes use Debezium's envelope instead (`op`, `before`, `after`, `source.lsn`).
 
@@ -323,6 +351,7 @@ The restarted loader waits for the crashed member's session to time out (`sessio
 
 ```bash
 docker compose run --rm billing-claims python scenario.py late --delay 120
+docker compose exec airflow dbt build   # activate dbt immediately
 ```
 
 A payment is recorded for a policy that will only be created 120 seconds later.
